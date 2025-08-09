@@ -47,8 +47,8 @@ def _set_session_from_auth_res(auth_res):
 
 sb = _sb()
 
-qp = st.query_params()
-if qp.get("type", [""])[0] == "recovery":
+qp = st.query_params
+if qp.get("type") == "recovery":
     st.info("Você veio de um link de recuperação. Faça login com a nova senha.")
 
 with st.sidebar:
