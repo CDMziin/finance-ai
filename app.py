@@ -7,7 +7,7 @@ from dateutil.relativedelta import relativedelta
 import re
 
 # === PERSISTÊNCIA (Supabase) e NLP ===
-import data_io_supabase as data_io   # <- use o arquivo que te enviei
+import data_io_supabase as data_io   
 from engine import parse
 
 # -------------------------------------------------------------------
@@ -47,7 +47,7 @@ def _set_session_from_auth_res(auth_res):
 
 sb = _sb()
 
-qp = st.experimental_get_query_params()
+qp = st.query_params()
 if qp.get("type", [""])[0] == "recovery":
     st.info("Você veio de um link de recuperação. Faça login com a nova senha.")
 
