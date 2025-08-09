@@ -1,3 +1,4 @@
+# app.py — Finance AI (Supabase + Streamlit)
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -5,146 +6,121 @@ from datetime import date, timedelta
 from dateutil.relativedelta import relativedelta
 import re
 
-# ====== SUPABASE ======
-from supabase import create_client, Client  # pip install supabase
-import os
+# === PERSISTÊNCIA (Supabase) e NLP ===
+import data_io_supabase as data_io   # <- use o arquivo que te enviei
+from engine import parse
 
-# ====== MÓDULOS LOCAIS ======
-import engine.data_io as data_io
-import engine.parse as parse
-
-# ---------------------------------------------
-# CONFIG BÁSICA
-# ---------------------------------------------
+# -------------------------------------------------------------------
+# CONFIG GERAL
+# -------------------------------------------------------------------
 st.set_page_config(page_title="Finance AI — Dashboard + Chat", layout="wide")
 
+# Tema (escuro fixo)
 PALETTE_DARK = ["#60A5FA", "#F87171", "#34D399", "#22D3EE", "#FBBF24", "#C4B5FD"]
 px.defaults.template = "plotly_dark"
 px.defaults.color_discrete_sequence = PALETTE_DARK
 px.defaults.width = None
 px.defaults.height = 320
 
-# ---------------------------------------------
-# SUPABASE HELPERS
-# ---------------------------------------------
-def get_supabase() -> Client:
-    url = st.secrets.get("SUPABASE_URL", os.getenv("SUPABASE_URL", ""))
-    key = st.secrets.get("SUPABASE_KEY", os.getenv("SUPABASE_KEY", ""))
-    if not url or not key:
-        raise RuntimeError("SUPABASE_URL/SUPABASE_KEY não configurados em st.secrets.")
-    return create_client(url, key)
+# -------------------------------------------------------------------
+# AUTENTICAÇÃO SUPABASE (sidebar)
+# -------------------------------------------------------------------
+from supabase import create_client
 
-def supabase_redirect_url_default() -> str:
-    return st.secrets.get("SUPABASE_URL_REDIRECT", "http://localhost:8501/reset")
+@st.cache_resource(show_spinner=False)
+def _sb():
+    return create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
 
-# ---------------------------------------------
-# AUTENTICAÇÃO - UI
-# ---------------------------------------------
-def auth_login_panel():
-    st.title("🔐 Acessar sua conta")
-    email = st.text_input("E-mail")
-    password = st.text_input("Senha", type="password")
-    c1, c2 = st.columns(2)
-    with c1:
-        if st.button("Entrar", use_container_width=True):
-            try:
-                sb = get_supabase()
-                sb.auth.sign_in_with_password({"email": email, "password": password})
-                st.session_state["auth_ok"] = True
-                st.rerun()
-            except Exception:
-                st.error("Login inválido. Verifique e tente novamente.")
-    with c2:
-        st.markdown("&nbsp;")
-        if st.button("Esqueci minha senha", use_container_width=True):
-            st.session_state["auth_view"] = "forgot"
-            st.rerun()
+def _clear_session():
+    for k in ("user_id", "user_email", "access_token", "refresh_token"):
+        st.session_state.pop(k, None)
 
-def auth_forgot_panel():
-    st.title("🔑 Esqueci minha senha")
-    email = st.text_input("Digite seu e-mail")
-    if st.button("Enviar link de redefinição"):
-        try:
-            sb = get_supabase()
-            sb.auth.reset_password_email(email, options={"redirect_to": supabase_redirect_url_default()})
-            st.success("Se o e-mail existir, você receberá o link para redefinição.")
-        except Exception as e:
-            st.error(f"Erro ao enviar o e-mail: {e}")
-    if st.button("Voltar ao login"):
-        st.session_state["auth_view"] = "login"
-        st.rerun()
+def _set_session_from_auth_res(auth_res):
+    user = getattr(auth_res, "user", None)
+    session = getattr(auth_res, "session", None)
+    if user:
+        st.session_state["user_id"] = user.id
+        st.session_state["user_email"] = user.email
+    if session:
+        st.session_state["access_token"] = session.access_token
+        st.session_state["refresh_token"] = session.refresh_token
 
-def auth_reset_panel():
-    st.title("🔄 Redefinir senha")
-    qp = st.query_params
-    access_token = qp.get("access_token", [None])
-    refresh_token = qp.get("refresh_token", [None])
-    access_token = access_token[0] if isinstance(access_token, list) else access_token
-    refresh_token = refresh_token[0] if isinstance(refresh_token, list) else refresh_token
+sb = _sb()
 
-    if not access_token or not refresh_token:
-        st.error("Link inválido ou expirado. Peça um novo e-mail de redefinição.")
-        if st.button("Voltar ao login"):
-            st.session_state["auth_view"] = "login"
-            st.rerun()
-        return
+qp = st.experimental_get_query_params()
+if qp.get("type", [""])[0] == "recovery":
+    st.info("Você veio de um link de recuperação. Faça login com a nova senha.")
 
-    new_pass = st.text_input("Nova senha", type="password")
-    if st.button("Atualizar senha"):
-        try:
-            sb = get_supabase()
-            sb.auth.set_session(access_token=access_token, refresh_token=refresh_token)
-            sb.auth.update_user({"password": new_pass})
-            st.success("Senha alterada com sucesso! Faça login novamente.")
-            st.query_params.clear()
-        except Exception as e:
-            st.error(f"Erro ao atualizar senha: {e}")
-    if st.button("Voltar ao login"):
-        st.session_state["auth_view"] = "login"
-        st.rerun()
+with st.sidebar:
+    st.markdown("### 🔐 Acesso")
+    if "user_id" not in st.session_state:
+        tab1, tab2, tab3 = st.tabs(["Entrar", "Criar conta", "Esqueci a senha"])
 
-def auth_guard() -> bool:
-    if "auth_ok" not in st.session_state: st.session_state["auth_ok"] = False
-    if "auth_view" not in st.session_state: st.session_state["auth_view"] = "login"
-    if st.session_state["auth_ok"]:
-        return True
-    view = st.session_state["auth_view"]
-    if view == "login":
-        auth_login_panel()
-    elif view == "forgot":
-        auth_forgot_panel()
-    elif view == "reset":
-        auth_reset_panel()
+        with tab1:
+            with st.form("signin"):
+                email = st.text_input("E-mail", key="signin_email")
+                pw = st.text_input("Senha", type="password", key="signin_pw")
+                if st.form_submit_button("Entrar"):
+                    try:
+                        res = sb.auth.sign_in_with_password({"email": email, "password": pw})
+                        _set_session_from_auth_res(res)
+                        st.success("Login ok!")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Falha no login: {e}")
+
+        with tab2:
+            with st.form("signup"):
+                email_up = st.text_input("E-mail", key="signup_email")
+                pw_up = st.text_input("Senha", type="password", key="signup_pw")
+                if st.form_submit_button("Criar conta"):
+                    try:
+                        res = sb.auth.sign_up({
+                            "email": email_up,
+                            "password": pw_up,
+                            "options": {"email_redirect_to": st.secrets.get("RESET_REDIRECT_URL")}
+                        })
+                        st.success("Conta criada! Verifique seu e-mail para confirmar.")
+                    except Exception as e:
+                        st.error(f"Erro ao criar conta: {e}")
+
+        with tab3:
+            with st.form("forgot"):
+                email_fp = st.text_input("E-mail", key="forgot_email")
+                if st.form_submit_button("Enviar e-mail de redefinição"):
+                    try:
+                        sb.auth.reset_password_email(
+                            email_fp,
+                            options={"redirect_to": st.secrets.get("RESET_REDIRECT_URL")}
+                        )
+                        st.success("Se o e-mail existir, enviamos o link de redefinição.")
+                    except Exception as e:
+                        st.error(f"Erro ao enviar e-mail: {e}")
     else:
-        st.session_state["auth_view"] = "login"
-        auth_login_panel()
-    return False
-
-def render_topbar_user_menu():
-    with st.sidebar:
-        st.markdown("### 👤 Conta")
+        st.write(f"Conectado como: **{st.session_state['user_email']}**")
         if st.button("Sair"):
             try:
-                sb = get_supabase()
                 sb.auth.sign_out()
             except Exception:
                 pass
-            st.session_state["auth_ok"] = False
-            st.session_state["auth_view"] = "login"
-            st.experimental_set_query_params()
+            _clear_session()
             st.rerun()
 
-# ---------------------------------------------
-# ESTADO DO APP (após login)
-# ---------------------------------------------
+# Se não logado, o app para aqui (sidebar fica visível)
+if "user_id" not in st.session_state:
+    st.stop()
+
+# -------------------------------------------------------------------
+# ESTADO
+# -------------------------------------------------------------------
 if "ref_date" not in st.session_state: st.session_state.ref_date = date.today()
-if "period" not in st.session_state: st.session_state.period = "Mês"
+if "period"   not in st.session_state: st.session_state.period   = "Mês"
 if "pending_tx" not in st.session_state: st.session_state.pending_tx = None
 if "chat_log" not in st.session_state: st.session_state.chat_log = []
 
-# ---------------------------------------------
-# HELPERS DO FINANCE APP
-# ---------------------------------------------
+# -------------------------------------------------------------------
+# HELPERS
+# -------------------------------------------------------------------
 def period_bounds(ref: date, kind: str):
     if kind == "Dia":
         start = ref; end = ref
@@ -183,11 +159,11 @@ def _ctx_reply(df: pd.DataFrame, saved_row: dict) -> str:
     return f"Investimento salvo. Siga aportando! Saldo do mês: **{fmt_brl(saldo)}**."
 
 def _undo_last():
-    df = data_io.load()
-    if df.empty:
-        st.session_state.chat_log.append(("assistant","Não há lançamentos para desfazer.")); return
-    data_io.save(df.iloc[:-1])
-    st.session_state.chat_log.append(("assistant","Último lançamento removido ✅"))
+    ok = data_io.delete_last()
+    if ok:
+        st.session_state.chat_log.append(("assistant","Último lançamento removido ✅"))
+    else:
+        st.session_state.chat_log.append(("assistant","Não há lançamentos para desfazer."))
 
 def _handle_special_commands(msg: str) -> bool:
     t = msg.lower().strip()
@@ -204,21 +180,9 @@ def _handle_special_commands(msg: str) -> bool:
         _undo_last(); return True
     return False
 
-# ---------------------------------------------
-# GATE DE AUTENTICAÇÃO
-# ---------------------------------------------
-if not auth_guard():
-    st.stop()
-
-render_topbar_user_menu()
-
-# ---------------------------------------------
-# APP — SEU DASHBOARD
-# ---------------------------------------------
-DF = data_io.load().copy()
-DF["data"] = pd.to_datetime(DF["data"], errors="coerce")
-DF = DF.dropna(subset=["data"]).sort_values("data")
-
+# -------------------------------------------------------------------
+# HEADER
+# -------------------------------------------------------------------
 st.markdown("## 🧮 Finance AI — Dashboard + Chat")
 st.caption("Registre por texto e visualize tudo em tempo real.")
 
@@ -257,6 +221,9 @@ with left:
         if st.button("Próximo ▶"):
             st.session_state.ref_date = next_period(st.session_state.ref_date, st.session_state.period); st.rerun()
 
+# -------------------------------------------------------------------
+# CHAT
+# -------------------------------------------------------------------
 with right:
     st.subheader("💬 Chat de lançamentos")
 
@@ -278,6 +245,7 @@ with right:
         user_msg = st.text_input("Mensagem", placeholder="Digite aqui...", key="chat_input")
         submitted = st.form_submit_button("Enviar")
 
+    # Confirmação pendente
     if st.session_state.pending_tx:
         p = st.session_state.pending_tx
         with st.container(border=True):
@@ -290,19 +258,15 @@ with right:
             c1, c2 = st.columns(2)
             with c1:
                 if st.button("✅ Confirmar"):
-                    df_atual = data_io.load().copy()
-                    df2 = pd.concat([df_atual, pd.DataFrame([p])], ignore_index=True)
-                    data_io.save(df2)
-
+                    # grava direto no Supabase
+                    data_io.append_row(p)
+                    # realinha filtros para o mês do lançamento
                     _saved_date = pd.to_datetime(p["data"]).date()
                     st.session_state.ref_date = _saved_date
                     if st.session_state.period not in ("Dia","Semana","Mês"):
                         st.session_state.period = "Mês"
-
-                    DF_now = data_io.load().copy()
-                    DF_now["data"] = pd.to_datetime(DF_now["data"], errors="coerce")
-                    DF_now = DF_now.dropna(subset=["data"]).sort_values("data")
-
+                    # recarrega e responde
+                    DF_now = data_io.load()
                     st.session_state.chat_log.append(("assistant", _ctx_reply(DF_now, p)))
                     st.session_state.pending_tx = None
                     st.rerun()
@@ -312,6 +276,7 @@ with right:
                     st.session_state.pending_tx = None
                     st.rerun()
 
+    # Envio
     if submitted and user_msg:
         st.session_state.chat_log.append(("user", user_msg))
         if not _handle_special_commands(user_msg):
@@ -329,9 +294,13 @@ with right:
                 st.session_state.chat_log.append(("assistant","Vou registrar isso. Confirma abaixo?"))
         st.rerun()
 
-# ===== KPIs =====
+# -------------------------------------------------------------------
+# DASHBOARD
+# -------------------------------------------------------------------
 start, end = period_bounds(st.session_state.ref_date, st.session_state.period)
-DF_now = data_io.load().copy()
+
+# carrega do Supabase (você pode passar start/end pra filtrar no server)
+DF_now = data_io.load()
 DF_now["data"] = pd.to_datetime(DF_now["data"], errors="coerce")
 DF_now = DF_now.dropna(subset=["data"]).sort_values("data")
 
@@ -364,7 +333,6 @@ with c3: kpi_box("Saldo", s_cur, s_cur-s_prev, good=True)
 
 st.caption(f"Período: {start.strftime('%d/%m/%Y')}–{end.strftime('%d/%m/%Y')}")
 
-# ===== gráficos =====
 def _brl0(v: float) -> str:
     return (f"R$ {v:,.0f}").replace(",","X").replace(".",",").replace("X",".")
 
